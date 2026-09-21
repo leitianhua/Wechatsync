@@ -68,6 +68,18 @@ function copyStaticFilesPlugin() {
           ...manifestContent.content_scripts
         ]
 
+        // 追加构建时间到版本号，便于 reload 后在扩展详情页一眼确认本次刷新是否成功。
+        // 只用 dist 产物，不污染源码 manifest.json。
+        // Chromium 要求 version 每段是 0-65536 的整数且最多 4 段，所以把时间拆成两段：
+        // 第 3 段 = 距 2026-01-01 的天数（日级），第 4 段 = HHMM 时分（分钟级，可见 reload 变化）。
+        const ts = new Date()
+        const pad = (n: number) => String(n).padStart(2, '0')
+        const epoch = new Date('2026-01-01T00:00:00')
+        const days = Math.floor((ts.getTime() - epoch.getTime()) / 86400000)
+        const hhmm = ts.getHours() * 100 + ts.getMinutes()
+        const baseSegments = String(manifestContent.version ?? '0.0.0').split('.').slice(0, 2).join('.')
+        manifestContent.version = `${baseSegments}.${days}.${hhmm}`
+
         writeFileSync(manifestPath, JSON.stringify(manifestContent, null, 2))
         console.log('[copy-static] Updated manifest.json with reader scripts')
       }

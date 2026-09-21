@@ -1147,31 +1147,8 @@ chrome.runtime.onInstalled.addListener(async details => {
     recordInstallTimestamp().catch(() => {})
   }
 
-  // 升级时打开 changelog 页面
-  if (details.reason === 'update') {
-    const previousVersion = details.previousVersion || '0.0.0'
-    const currentVersion = chrome.runtime.getManifest().version
-
-    // 重要版本升级时显示更新日志
-    const showChangelogVersions = ['2.0.8', '2.0.9']
-    if (
-      showChangelogVersions.includes(currentVersion) ||
-      (previousVersion.startsWith('1.') && currentVersion.startsWith('2.'))
-    ) {
-      chrome.tabs.create({
-        url: 'https://www.wechatsync.com/changelog?from=' + previousVersion + '&to=' + currentVersion,
-        active: true,
-      })
-    }
-  }
-
-  // 首次安装时打开欢迎页
-  if (details.reason === 'install') {
-    chrome.tabs.create({
-      url: 'https://www.wechatsync.com/?utm_source=extension&utm_medium=install',
-      active: true,
-    })
-  }
+  // 已移除：升级/安装时自动打开 wechatsync 官网 changelog 与欢迎页的跳转
+  // （本 fork 自用，重新加载扩展时不再跳转到外部主页，避免打断当前页面）
 })
 
 /**

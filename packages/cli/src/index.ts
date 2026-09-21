@@ -632,6 +632,7 @@ program
   .option('-p, --platforms <platforms>', '目标平台，逗号分隔', 'zhihu,juejin')
   .option('-t, --title <title>', '文章标题（默认从文件提取）')
   .option('--cover <url>', '封面图 URL 或本地路径')
+  .option('--publish', '直接发布（不存草稿），配合已支持直发的平台生效')
   .option('--dry-run', '仅显示将要执行的操作，不实际同步')
   .action(async (file: string, options) => {
     // 检查文件是否存在
@@ -687,6 +688,7 @@ program
     console.log(`  标题: ${chalk.cyan(title)}`)
     console.log(`  格式: ${chalk.cyan(parsed.format)}${parsed.format === 'html' ? chalk.green(' (保留原始排版)') : ''}`)
     console.log(`  平台: ${chalk.cyan(platforms.join(', '))}`)
+    console.log(`  模式: ${options.publish ? chalk.green('直接发布') : chalk.gray('存草稿')}`)
     console.log(`  内容: ${chalk.gray(parsed.content.length + ' 字符')}`)
     if (cover) {
       console.log(`  封面: ${chalk.cyan(cover.startsWith('data:') ? '(本地图片)' : cover)}`)
@@ -746,6 +748,7 @@ program
     try {
       const response = await bridge.request<{ results: SyncResult[]; syncId: string }>('syncArticle', {
         platforms,
+        publish: !!options.publish,
         article: {
           title,
           markdown: processedMarkdown,

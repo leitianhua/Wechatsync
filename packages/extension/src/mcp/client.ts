@@ -402,6 +402,7 @@ export class McpClient {
 
       case 'syncArticle': {
         const platforms = params?.platforms as string[]
+        const publish = params?.publish as boolean | undefined
         const articleData = params?.article as {
           title: string
           content?: string
@@ -441,7 +442,7 @@ export class McpClient {
         const { results, syncId } = await performSync(
           article,
           platforms,
-          { source: 'mcp' }
+          { source: 'mcp', draftOnly: !publish }
         )
 
         return { results, syncId }

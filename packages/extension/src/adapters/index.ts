@@ -31,6 +31,7 @@ import {
   ZhihuAdapter,
   JuejinAdapter,
   CSDNAdapter,
+  TencentCloudAdapter,
   WeiboAdapter,
   BilibiliAdapter,
   BaijiahaoAdapter,
@@ -84,6 +85,7 @@ const ADAPTER_CLASSES: AdapterConstructor[] = [
   BilibiliAdapter,
   BaijiahaoAdapter,
   CSDNAdapter,
+  TencentCloudAdapter,
   YuqueAdapter,
   DoubanAdapter,
   SohuAdapter,
@@ -483,7 +485,8 @@ export async function syncToMultiplePlatforms(
   platformIds: string[],
   article: Article,
   callbacks?: SyncCallbacks,
-  source = 'popup' // 来源：popup, weixin, weixin-editor, mcp 等
+  source = 'popup', // 来源：popup, weixin, weixin-editor, mcp 等
+  draftOnly = true // 默认存草稿；false 时按平台是否支持直发直接发布
 ): Promise<SyncResult[]> {
   // 创建新的取消控制器
   syncAbortController = new AbortController()
@@ -565,7 +568,7 @@ export async function syncToMultiplePlatforms(
     const result = await syncToPlatform(
       platformId,
       article,
-      undefined,
+      { draftOnly },
       wrappedImageProgress
     )
 

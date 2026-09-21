@@ -9,6 +9,7 @@ export default defineConfig({
   banner: {
     js: '#!/usr/bin/env node',
   },
-  // 把 mcp-server 的代码打包进来，不作为外部依赖
-  noExternal: ['@wechatsync/mcp-server'],
+  // 把 mcp-server 与 juice 都打进单文件，不做外部依赖
+  // （juice 也 bundle 进来，使 CLI 自包含，不依赖运行目录额外安装）
+  noExternal: ['@wechatsync/mcp-server', 'juice'],
 })

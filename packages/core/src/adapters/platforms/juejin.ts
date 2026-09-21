@@ -13,6 +13,12 @@ const logger = createLogger('Juejin')
 const IMAGEX_AID = '2608'
 const IMAGEX_SERVICE_ID = '73owjymdk6'
 
+// content_api 公共参数（抓包: /content_api/v1/article/publish?aid=2608&uuid=<web_id>）
+const CONTENT_API_AID = '2608'
+
+// 掘金埋点 Cookie，里面存着前端 web_id（即 API 公共参数 uuid）
+const TEA_COOKIE_NAME = '__tea_cookie_tokens_2608'
+
 // 生成 UUID (用于 ImageX API)
 function generateUUID(): string {
   return 'xxxxxxxxxxxxxxxx'.replace(/x/g, () =>
@@ -91,6 +97,35 @@ interface ImageXCommitUploadResponse {
       ImageSize: number
     }>
   }
+}
+
+// 文章发布响应类型（err_no=0 时 data.article_id 为新文章 ID）
+interface ArticlePublishResponse {
+  data?: {
+    article_id?: string | number
+    id?: string | number
+  }
+  err_no?: number
+  err_msg?: string
+}
+
+// 编辑器 autoSaveDraft 抓包的正文图片对照项：签名 URL -> 裸 StoreUri
+interface JuejinPic {
+  pic_url: string
+  pic_uri: string
+}
+
+// 正文摘要（brief_content）生成规则，实测逐字节复刻编辑器 autoSaveDraft 抓包：
+// 去图片、链接留文字、去标题井号、连续空白折叠为单空格、截前 100 字符。
+// 实测该字段为空串时 article/publish 直接报「参数错误」（与 UI 成功发布草稿 diff 出的唯一实质差异）
+export function buildJuejinBrief(markdown: string): string {
+  return markdown
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100)
 }
 
 export class JuejinAdapter extends CodeAdapter {
@@ -203,14 +238,14 @@ export class JuejinAdapter extends CodeAdapter {
       logger.info('Starting publish...')
 
       // 1. 获取 CSRF token
-      const csrfToken = await this.getCsrfToken()
+      const csrfToken = await this.withTimeout('CSRF', 15000, () => this.getCsrfToken())
 
       // 2. 使用预处理好的 markdown（Content Script 已转换）
       // 掘金使用 Markdown 格式
       let markdown = article.markdown || ''
 
       // 3. 处理图片（上传到掘金图床）
-      markdown = await this.processImages(
+      markdown = await this.withTimeout('图片转存', 120000, () => this.processImages(
         markdown,
         (src) => this.uploadImageByUrl(src),
         {
@@ -220,14 +255,14 @@ export class JuejinAdapter extends CodeAdapter {
           ],
           onProgress: options?.onImageProgress,
         }
-      )
+      ))
 
       // 上传封面图(如有),只将新的平台图床 URL 写入草稿
       let coverImage = ''
       if (article.cover) {
         try {
           logger.info('Uploading cover image...')
-          const coverRes = await this.uploadImageByUrl(article.cover)
+          const coverRes = await this.withTimeout('封面上传', 30000, () => this.uploadImageByUrl(article.cover!))
           if (coverRes.url && coverRes.url !== article.cover && !coverRes.url.startsWith('data:')) {
             coverImage = coverRes.url
             logger.debug('Cover uploaded:', coverImage)
@@ -239,8 +274,19 @@ export class JuejinAdapter extends CodeAdapter {
         }
       }
 
+      // 5. 编辑器 autoSaveDraft 实测的最后一步转换：图床图片签名长 URL 换成裸 StoreUri，
+      //    签名 URL 记进 pics（与编辑器行为对齐；服务端读取草稿时会再签回长 URL）
+      const { content: storedMarkdown, pics } = this.transformPicsToStoreUri(markdown)
+      // brief_content 必须非空，否则 article/publish 报「参数错误」（见 buildJuejinBrief 注释）
+      const briefContent = buildJuejinBrief(storedMarkdown)
+
       // 6. 创建草稿 (参数来自 DSL juejin.yaml + juejin.transform.ts prepareBody)
-      const createResponse = await this.runtime.fetch(
+      // category_id 传 '0' 时直发被服务端拒「至少添加一个分类」，固定用真实分类「开发工具」
+      // 实测 create 带非空 tag_ids 会被拒「参数错误」，编辑器真实流程是 create 空标签
+      // -> update 才写 tag_ids，所以标签在这一步留空，建完草稿后用 updateDraftTags 补写
+      const tagIds = await this.resolveTagIds(article.tags)
+
+      const createResponse = await this.withTimeout('创建草稿', 30000, () => this.runtime.fetch(
         'https://api.juejin.cn/content_api/v1/article_draft/create',
         {
           method: 'POST',
@@ -250,18 +296,18 @@ export class JuejinAdapter extends CodeAdapter {
             'x-secsdk-csrf-token': csrfToken,
           },
           body: JSON.stringify({
-            brief_content: '',
-            category_id: '0',
+            brief_content: briefContent,
+            category_id: '6809637771511070734',
             cover_image: coverImage,
             edit_type: 10,
             html_content: 'deprecated',
             link_url: '',
-            mark_content: markdown,
+            mark_content: storedMarkdown,
             tag_ids: [],
             title: article.title,
           }),
         }
-      )
+      ))
 
       // 检查响应状态和内容
       const responseText = await createResponse.text()
@@ -280,7 +326,7 @@ export class JuejinAdapter extends CodeAdapter {
 
       // 检查业务错误
       if (createData.err_no && createData.err_no !== 0) {
-        throw new Error(createData.err_msg || `创建草稿失败: 错误码 ${createData.err_no}`)
+        throw new Error(`[创建草稿] ${createData.err_msg || `错误码 ${createData.err_no}`}`)
       }
 
       if (!createData.data?.id) {
@@ -292,14 +338,366 @@ export class JuejinAdapter extends CodeAdapter {
 
       const draftUrl = `https://juejin.cn/editor/drafts/${draftId}`
 
+      // 7. 编辑器实测：tag_ids 只能通过 update 绑定（create 带非空标签被拒「参数错误」）
+      await this.updateDraftTags(draftId, article.title, storedMarkdown, coverImage, briefContent, tagIds, pics, csrfToken)
+
+      // draftOnly（默认）时行为与之前完全一致：只建草稿
+      if (options?.draftOnly ?? true) {
+        return this.createResult(true, {
+          postId: draftId,
+          postUrl: draftUrl,
+          draftOnly: true,
+        })
+      }
+
+      // 8. 正式发布（建草稿成功后调用真实"点发布"接口）
+      // 字数必须按「转换后落库的内容」估算，与服务端重算口径一致
+      const articleId = await this.publishDraft(draftId, this.estimateOriginWordCount(storedMarkdown), csrfToken)
+
+      if (!articleId) {
+        // 发布请求已成功，但解析不到文章 ID -> 回退编辑器地址（待实测真实链接格式）
+        logger.warn('Publish succeeded but article id missing, fallback to editor url')
+        return this.createResult(true, {
+          postId: draftId,
+          postUrl: draftUrl,
+          draftOnly: false,
+          message: '发布请求已提交，但未能从响应中解析到文章 ID，postUrl 回退为编辑器草稿地址',
+        })
+      }
+
+      logger.info('Published article:', articleId)
+
       return this.createResult(true, {
-        postId: draftId,
-        postUrl: draftUrl,
-        draftOnly: options?.draftOnly ?? true,
+        postId: articleId,
+        postUrl: `https://juejin.cn/post/${articleId}`,
+        draftOnly: false,
       })
     }).catch((error) => this.createResult(false, {
       error: (error as Error).message,
     }))
+  }
+
+  /**
+   * 正式发布草稿
+   * 请求来自真实抓包: POST /content_api/v1/article/publish?aid=2608&uuid=<web_id>
+   * @param draftId 草稿 ID（article_draft/create 返回的 data.id）
+   * @param originWordCount 正文明文字数（近似值）
+   * @param csrfToken 已获取的 x-secsdk-csrf-token
+   * @returns 文章 ID；响应里解析不到时返回 null，由调用方回退
+   */
+  private async publishDraft(
+    draftId: string,
+    originWordCount: number,
+    csrfToken: string
+  ): Promise<string | null> {
+    const uuid = await this.getWebId()
+    const url = `https://api.juejin.cn/content_api/v1/article/publish?aid=${CONTENT_API_AID}&uuid=${uuid}`
+
+    const response = await this.withTimeout('正式发布', 30000, () => this.runtime.fetch(url, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-secsdk-csrf-token': csrfToken,
+      },
+      // 编辑器实测: encrypted_word_count 必填，值 = (origin_word_count ^ 538942) + 538942
+      // （掘金 app bundle 里 maskCount 公式）。服务端不严格核对字数与正文（UI 实测发 502、
+      // 真实 worker 重算 537 仍发布成功），但加密值必须和 origin_word_count 自洽
+      body: JSON.stringify({
+        draft_id: draftId,
+        sync_to_org: false,
+        column_ids: [],
+        theme_ids: [],
+        origin_word_count: originWordCount,
+        encrypted_word_count: (originWordCount ^ 538942) + 538942,
+      }),
+    }))
+
+    const responseText = await response.text()
+    logger.debug('Publish response:', response.status, responseText.substring(0, 300))
+
+    if (!response.ok) {
+      throw new Error(`发布失败: ${response.status} - ${responseText}`)
+    }
+
+    let publishData: ArticlePublishResponse
+    try {
+      publishData = JSON.parse(responseText)
+    } catch {
+      throw new Error(`发布失败: 响应不是有效 JSON - ${responseText.substring(0, 100)}`)
+    }
+
+    // 检查业务错误
+    if (publishData.err_no && publishData.err_no !== 0) {
+      throw new Error(`[正式发布] ${publishData.err_msg || `错误码 ${publishData.err_no}`}`)
+    }
+
+    const articleId = publishData.data?.article_id || publishData.data?.id
+    if (!articleId) {
+      return null
+    }
+
+    return String(articleId)
+  }
+
+  /**
+   * 给草稿补写分类+标签
+   * 请求体逐字段照抄编辑器实测抓包: POST /content_api/v1/article_draft/update
+   * @param draftId 草稿 ID
+   * @param title 文章标题
+   * @param markdown 正文（Markdown，已经过 transformPicsToStoreUri 转换）
+   * @param coverImage 已上传到平台图床的封面 URL，可空
+   * @param briefContent 正文摘要（见 buildJuejinBrief，发布校验要求非空）
+   * @param tagIds 站内标签 ID 数组（见 resolveTagIds）
+   * @param pics 正文图片裸 StoreUri 与签名 URL 对照表（见 transformPicsToStoreUri）
+   * @param csrfToken 已获取的 x-secsdk-csrf-token
+   */
+  private async updateDraftTags(
+    draftId: string,
+    title: string,
+    markdown: string,
+    coverImage: string,
+    briefContent: string,
+    tagIds: string[],
+    pics: JuejinPic[],
+    csrfToken: string
+  ): Promise<void> {
+    const uuid = await this.getWebId()
+    const response = await this.withTimeout('补写标签', 30000, () => this.runtime.fetch(
+      `https://api.juejin.cn/content_api/v1/article_draft/update?aid=${CONTENT_API_AID}&uuid=${uuid}`,
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-secsdk-csrf-token': csrfToken,
+        },
+        // is_gfw/is_english/is_original + pics 为编辑器 autoSaveDraft 实测抓包字段，与编辑器落库状态对齐
+        body: JSON.stringify({
+          id: draftId,
+          category_id: '6809637771511070734',
+          tag_ids: tagIds,
+          link_url: '',
+          cover_image: coverImage,
+          title,
+          brief_content: briefContent,
+          edit_type: 10,
+          html_content: 'deprecated',
+          mark_content: markdown,
+          theme_ids: [],
+          pics,
+          is_gfw: 0,
+          is_english: 0,
+          is_original: 1,
+        }),
+      }
+    ))
+
+    const responseText = await response.text()
+    logger.debug('Update draft (tags) response:', response.status, responseText.substring(0, 200))
+
+    if (!response.ok) {
+      throw new Error(`草稿补写标签失败: ${response.status} - ${responseText}`)
+    }
+
+    let data: { err_no?: number; err_msg?: string }
+    try {
+      data = JSON.parse(responseText)
+    } catch {
+      throw new Error(`草稿补写标签失败: 响应不是有效 JSON - ${responseText.substring(0, 100)}`)
+    }
+    if (data.err_no && data.err_no !== 0) {
+      throw new Error(`[补写标签] ${data.err_msg || `错误码 ${data.err_no}`}`)
+    }
+  }
+
+  /**
+   * 照抄编辑器 autoSaveDraft 前的最后一步转换（实测抓包 cap4.json）：
+   * 把 ImageX 图床的签名长 URL 图片 `![](<https://...tos-cn-i-73owjymdk6/<id>~tplv...>))`
+   * 换成裸 StoreUri `![](tos-cn-i-73owjymdk6/<id>)`，同时收集 {pic_url, pic_uri} 供 update 的 pics 字段。
+   * 服务端以转换后落库内容重算字数，跳过这一步会让 article/publish 永远「参数错误」。
+   */
+  private transformPicsToStoreUri(markdown: string): { content: string; pics: JuejinPic[] } {
+    const pics: JuejinPic[] = []
+    const content = markdown.replace(
+      /!\[[^\]]*\]\((https?:\/\/[^)\s]*?tos-cn-i-73owjymdk6\/([A-Za-z0-9]+)[^)\s]*)\)/g,
+      (_match, url: string, id: string) => {
+        const picUri = `tos-cn-i-73owjymdk6/${id}`
+        pics.push({ pic_url: url, pic_uri: picUri })
+        return `![](${picUri})`
+      }
+    )
+    if (pics.length) {
+      logger.debug('Transformed image store uris:', pics.length)
+    }
+    return { content, pics }
+  }
+
+  /**
+   * 获取前端埋点 web_id（掘金 API 公共参数 uuid）
+   * 抓包值 7534710285519013426 来自埋点 Cookie，跟 ImageX 用的随机 this.uuid 不是一个来源
+   * @returns web_id；取不到时返回空串（待实测服务端是否强校验 uuid）
+   */
+  private async getWebId(): Promise<string> {
+    if (!this.runtime.getCookie) {
+      logger.warn('runtime.getCookie unavailable, publish uuid will be empty')
+      return ''
+    }
+
+    try {
+      // Cookie 值是双重 URL 编码的 JSON: %257B%2522web_id%2522%253A...
+      // getCookie RPC 曾出现无响应挂死，uuid 服务端不强校验，8 秒拿不到就按空串走后续流程
+      let raw = (await this.withTimeout('读web_id_cookie', 8000, () => this.runtime.getCookie!('.juejin.cn', TEA_COOKIE_NAME))
+        .catch(() => {
+          logger.warn('getCookie web_id timed out, uuid will be empty')
+          return null
+        })) || ''
+      for (let i = 0; i < 2 && raw && !raw.trim().startsWith('{'); i++) {
+        try {
+          const decoded = decodeURIComponent(raw)
+          if (decoded === raw) break  // 已无编码可解
+          raw = decoded
+        } catch {
+          break  // 编码异常时保留原值，交给下面的正则兜底
+        }
+      }
+
+      if (raw) {
+        try {
+          const tea = JSON.parse(raw) as { web_id?: string; user_unique_id?: string }
+          const webId = tea.web_id || tea.user_unique_id || ''
+          if (webId) {
+            logger.debug('Got web_id:', webId)
+            return webId
+          }
+        } catch {
+          // JSON 解析失败，交给下面的正则兜底
+        }
+
+        // 兜底: 编码值里的 %2522 等片段带数字，锚定正则会失配，所以退而取长数字串（web_id 是 19 位雪花 ID）
+        const fallback = raw.match(/web_id\D+(\d{6,})/)?.[1] || raw.match(/\d{15,}/)?.[0] || ''
+        if (fallback) {
+          logger.debug('Got web_id by regex:', fallback)
+          return fallback
+        }
+      }
+
+      logger.warn('web_id not found in juejin tea cookie, publish uuid will be empty')
+    } catch (error) {
+      logger.warn('Failed to read web_id cookie:', (error as Error).message)
+    }
+
+    return ''
+  }
+
+  /**
+   * 给可能无响应挂死的 await（runtime.fetch/getCookie 等 RPC）包一层带环节名的超时，
+   * 保证 syncArticle 永远能在 CLI 360s 超时前带明确原因返回，而不是整条链路静默悬挂
+   */
+  private withTimeout<T>(label: string, ms: number, fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`[${label}] 步骤超时 ${Math.round(ms / 1000)}s（RPC/网络无响应）`)),
+        ms
+      )
+      fn().then(
+        (value) => { clearTimeout(timer); resolve(value) },
+        (error) => { clearTimeout(timer); reject(error) }
+      )
+    })
+  }
+
+  /**
+   * 把标签名解析为站内已有 tag_id（掘金直发强制「至少添加一个标签」，且不认识新标签）
+   * 接口来自编辑器标签搜索抓包: POST /tag_api/v1/query_tag_list
+   * 匹配不到时兜底用「笔记」（实测存在），与 CSDN/51CTO 的固定标签口径保持一致
+   */
+  private async resolveTagIds(names: string[] | undefined): Promise<string[]> {
+    const FALLBACK_TAG_ID = '6809641211075231751' // 「笔记」
+    const wanted = (names && names.length ? names : []).slice(0, 3)
+    const ids: string[] = []
+
+    for (const name of wanted) {
+      try {
+        const tagId = await this.searchTagId(name.trim())
+        if (tagId && !ids.includes(tagId)) ids.push(tagId)
+      } catch (error) {
+        logger.warn(`Tag lookup failed for "${name}":`, (error as Error).message)
+      }
+    }
+
+    if (!ids.length) {
+      logger.warn('No tag resolved from', wanted, '-> fallback to 笔记')
+      return [FALLBACK_TAG_ID]
+    }
+    logger.debug('Resolved tag_ids:', ids)
+    return ids
+  }
+
+  /**
+   * 单个标签名查 tag_id：优先大小写不敏感的全匹配，否则取第一条结果
+   */
+  private async searchTagId(keyword: string): Promise<string | null> {
+    if (!keyword) return null
+    const uuid = await this.getWebId()
+    const url = `https://api.juejin.cn/tag_api/v1/query_tag_list?aid=${CONTENT_API_AID}&uuid=${uuid}`
+
+    const response = await this.runtime.fetch(url, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ cursor: '0', key_word: keyword, limit: 10, sort_type: 1 }),
+    })
+
+    if (!response.ok) {
+      throw new Error(`query_tag_list HTTP ${response.status}`)
+    }
+
+    const data = await response.json() as {
+      data?: Array<{ tag_id?: string; tag?: { tag_name?: string } }>
+      err_no?: number
+    }
+    if (data.err_no && data.err_no !== 0) {
+      throw new Error(`query_tag_list err_no=${data.err_no}`)
+    }
+
+    const list = data.data || []
+    const exact = list.find(t => (t.tag?.tag_name || '').toLowerCase() === keyword.toLowerCase())
+    const hit = exact || list[0]
+    if (!hit?.tag_id) {
+      logger.warn(`No站内 tag found for "${keyword}"`)
+      return null
+    }
+    return String(hit.tag_id)
+  }
+
+  /**
+   * 估算正文原始字数（对应抓包里的 origin_word_count）
+   * 移植自掘金编辑器字数统计 worker: xitu_juejin_web_editor/js/count.*.worker.js
+   * 服务端不严格核对字数与正文内容（UI 实测 502 vs 真实 worker 537 仍通过），报个合理值即可
+   */
+  private estimateOriginWordCount(markdown: string): number {
+    if (!markdown) return 0
+    let src = markdown
+    src = src.replace(/```mermaid[^]*?```?/gs, '')      // mermaid 图
+    src = src.replace(/\$[\s\S]+?\$\$|\$[\s\S]+?\$/g, '') // 公式
+    src = src.replace(/.*---\ntheme:.*?\n---/gs, '')    // 主题头
+    src = src.replace(/.*---\nhighlight:.*?\n---/gs, '') // 高亮头
+    src = src.replace(/<link\S+?<\/link>/gs, '')
+    src = src.replace(/<style\S+?<\/style>/gs, '')
+    src = src.replace(/<script\S+?<\/script>/gs, '')
+    src = src.replace(/<\S\s+?>/gs, '\n')               // 带属性的单标签转行
+    src = src.replace(/\s{2,}/gs, '\n')                 // 连续空白折叠
+    src = src.replace(/!\[.*\]\(http.*?\)/g, '')        // 外链图片
+    src = src.replace(/((http|https):\/\/)?[\w\-_]+(\.[\w\-_]+)+([\w.,@?^=%&:\/~+#-]*[\w@?^=%&\/~+#-])?/gs, '') // URL
+    src = src.replace(/<[^>\n\u4e00-\u9fff]*>/g, '')    // 残留 HTML 标签
+    src = src.trim()
+
+    const reg = new RegExp('[\u4e00-\u9fbf\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff]|[a-zA-Z]+|\\d', 'g')
+    const matches = src.match(reg)
+    return matches ? matches.length : 0
   }
 
   /**

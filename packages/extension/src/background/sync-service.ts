@@ -62,6 +62,8 @@ interface SyncHistoryItem {
 interface SyncOptions {
   skipHistory?: boolean
   source?: string
+  draftOnly?: boolean
+  publish?: boolean
 }
 
 // 进度回调
@@ -233,7 +235,8 @@ export async function performSync(
   options: SyncOptions = {},
   callbacks: SyncProgressCallbacks = {}
 ): Promise<{ results: SyncResult[]; syncId: string }> {
-  const { skipHistory = false, source = 'mcp' } = options
+  const { skipHistory = false, source = 'mcp', publish = false } = options
+  const draftOnly = options.draftOnly ?? !publish
   const { onResult, onImageProgress, onDetailProgress } = callbacks
 
   const allPlatformMetas = getAllPlatformMetas()
@@ -328,7 +331,7 @@ export async function performSync(
       onDetailProgress: (progress: SyncDetailProgress) => {
         onDetailProgress?.(progress)
       },
-    }, source)
+    }, source, draftOnly)
   }
 
   // 同步到 CMS 账户

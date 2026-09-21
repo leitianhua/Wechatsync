@@ -12,6 +12,30 @@ const logger = createLogger('Zhihu')
 // js-md5 导出的是函数本身
 const jsMd5 = md5Lib as unknown as (message: string | ArrayBuffer | Uint8Array) => string
 
+/** 发布接口请求体（结构逐项照抓包，值换成运行时值） */
+interface ZhihuPublishBody {
+  action: 'article'
+  data: {
+    publish: { traceId: string }
+    extra_info: { publisher: 'pc'; pc_business_params: string }
+    draft: { disabled: number; id: string; isPublished: boolean }
+    commentsPermission: { comment_permission: string }
+    creationStatement: { disclaimer_type: string; disclaimer_status: string }
+    contentsTables: { table_of_contents_enabled: boolean }
+    commercialReportInfo: { isReport: number }
+    appreciate: { can_reward: boolean; tagline: string }
+    hybridInfo: Record<string, never>
+    hybrid: { html: string; textLength: number }
+    title: { title: string }
+  }
+}
+
+/** 发布接口响应（知乎 API 失败时常见 {"error":{...}}） */
+interface ZhihuPublishResponse {
+  error?: { code?: number | string; name?: string; message?: string }
+  [key: string]: unknown
+}
+
 export class ZhihuAdapter extends CodeAdapter {
   readonly meta: PlatformMeta = {
     id: 'zhihu',
@@ -92,9 +116,65 @@ export class ZhihuAdapter extends CodeAdapter {
   }
 
   async publish(article: Article, options?: PublishOptions): Promise<SyncResult> {
-    return this.withHeaderRules(this.HEADER_RULES, async () => {
-      logger.info('Starting publish...')
+    logger.info('Starting publish...')
 
+    const draftOnly = options?.draftOnly ?? true
+
+    let draft: { draftId: string; content: string }
+    try {
+      draft = await this.saveDraft(article, options)
+    } catch (error) {
+      return this.createResult(false, { error: (error as Error).message })
+    }
+
+    const { draftId, content } = draft
+    const draftUrl = `https://zhuanlan.zhihu.com/p/${draftId}/edit`
+
+    if (draftOnly) {
+      return this.createResult(true, {
+        postId: draftId,
+        postUrl: draftUrl,
+        draftOnly: true,
+      })
+    }
+
+    // 直发：publish 走 www.zhihu.com 域，另起一个 Header 规则作用域。
+    // 不能嵌在上面的 withHeaderRules 里——DNR 同优先级只会命中一条规则，
+    // 先加的 '*://www.zhihu.com/api/*' 规则会抢走这次请求，Origin/Referer 覆盖就丢了。
+    try {
+      await this.publishDraft(draftId, article.title, content)
+    } catch (error) {
+      const message = (error as Error).message
+      logger.error('Publish failed:', message)
+      // 草稿已经保存成功，把草稿信息一起带回，方便用户去草稿箱处理
+      return this.createResult(false, {
+        postId: draftId,
+        postUrl: draftUrl,
+        draftOnly: true,
+        error: `草稿已保存但发布失败，可前往知乎草稿箱手动发布: ${message}`,
+      })
+    }
+
+    // 草稿 id 即文章 id
+    const postUrl = `https://zhuanlan.zhihu.com/p/${draftId}`
+    logger.info('Published:', postUrl)
+
+    return this.createResult(true, {
+      postId: draftId,
+      postUrl,
+      draftOnly: false,
+    })
+  }
+
+  /**
+   * 草稿链路: 建草稿 -> 传图 -> 内容转换 -> PATCH 写入
+   * 返回草稿 id 和最终写进草稿的 HTML（发布时要用同一份内容）
+   */
+  private async saveDraft(
+    article: Article,
+    options?: PublishOptions
+  ): Promise<{ draftId: string; content: string }> {
+    return this.withHeaderRules(this.HEADER_RULES, async () => {
       // 1. 创建草稿
       const createResponse = await this.runtime.fetch('https://zhuanlan.zhihu.com/api/articles/drafts', {
         method: 'POST',
@@ -176,16 +256,169 @@ export class ZhihuAdapter extends CodeAdapter {
 
       logger.debug('Draft updated, status:', updateResponse.status)
 
-      const draftUrl = `https://zhuanlan.zhihu.com/p/${draftId}/edit`
+      return { draftId, content }
+    })
+  }
 
-      return this.createResult(true, {
-        postId: draftId,
-        postUrl: draftUrl,
-        draftOnly: options?.draftOnly ?? true,
+  /**
+   * 正式发布: POST https://www.zhihu.com/api/v4/content/publish
+   * 请求体按抓包结构拼装（草稿 id 即文章 id）
+   */
+  private async publishDraft(draftId: string, title: string, html: string): Promise<void> {
+    const xsrfToken = await this.getXsrfToken()
+    if (!xsrfToken) {
+      throw new Error('未取到 _xsrf，请确认已登录知乎后重试')
+    }
+
+    // 抓包口径: 去掉标签后的文本长度
+    const textLength = html.replace(/<[^>]*>/g, '').length
+
+    // pc_business_params 在抓包里是"字符串里的 JSON"，交给 JSON.stringify 处理转义层次
+    const pcBusinessParams = {
+      commentPermission: 'anyone',
+      disclaimer_type: 'none',
+      disclaimer_status: 'close',
+      table_of_contents_enabled: false,
+      content: html,
+      title,
+      commercial_report_info: { commercial_types: [] as string[] },
+      commercial_zhitask_bind_info: null,
+      canReward: false,
+    }
+
+    const body: ZhihuPublishBody = {
+      action: 'article',
+      data: {
+        publish: {
+          traceId: `${Date.now()},${this.createUuid()}`,
+        },
+        extra_info: {
+          publisher: 'pc',
+          pc_business_params: JSON.stringify(pcBusinessParams),
+        },
+        draft: {
+          disabled: 1,
+          id: draftId,
+          isPublished: false,
+        },
+        commentsPermission: {
+          comment_permission: 'anyone',
+        },
+        creationStatement: {
+          disclaimer_type: 'none',
+          disclaimer_status: 'close',
+        },
+        contentsTables: {
+          table_of_contents_enabled: false,
+        },
+        commercialReportInfo: {
+          isReport: 0,
+        },
+        appreciate: {
+          can_reward: false,
+          tagline: '',
+        },
+        hybridInfo: {},
+        hybrid: {
+          html,
+          textLength,
+        },
+        title: {
+          title,
+        },
+      },
+    }
+
+    const rules = [
+      {
+        urlFilter: '*://www.zhihu.com/api/v4/content/publish',
+        headers: {
+          'x-requested-with': 'fetch',
+          'Origin': 'https://zhuanlan.zhihu.com',
+          'Referer': `https://zhuanlan.zhihu.com/p/${draftId}/edit`,
+        },
+        resourceTypes: ['xmlhttprequest'],
+      },
+    ]
+
+    return this.withHeaderRules(rules, async () => {
+      const response = await this.runtime.fetch('https://www.zhihu.com/api/v4/content/publish', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-requested-with': 'fetch',
+          'x-xsrftoken': xsrfToken,
+          // 抓包带的固定串；x-zse-96 / x-zst-81 签名未实现（登录 cookie 下写接口通常免签）
+          'x-zse-93': '101_3_3.0',
+        },
+        body: JSON.stringify(body),
       })
-    }).catch((error) => this.createResult(false, {
-      error: (error as Error).message,
-    }))
+
+      const responseText = await response.text()
+      logger.debug('Publish response:', response.status, responseText.substring(0, 300))
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('未登录或登录已过期，请重新登录知乎')
+        }
+        if (response.status === 403) {
+          // 实测(2026-09-21): 登录态正常时发布接口也回 403（code 10001 请求参数异常），
+          // 是缺 x-zse-96 风控签名被拦，不是登录问题
+          throw new Error('发布被知乎风控拦截(403)：发布接口需要 x-zse-96 签名，适配器未实现；草稿已存，请到草稿箱手动点发布')
+        }
+        throw new Error(`发布失败: ${response.status} - ${responseText}`)
+      }
+
+      // HTTP 200 仍可能带 error 字段，需要读响应体判断
+      let publishData: ZhihuPublishResponse
+      try {
+        publishData = responseText.trim()
+          ? JSON.parse(responseText) as ZhihuPublishResponse
+          : {}
+      } catch {
+        throw new Error(`发布失败: 响应不是有效 JSON - ${responseText.substring(0, 100)}`)
+      }
+
+      if (publishData.error) {
+        throw new Error(`发布失败: ${publishData.error.message || JSON.stringify(publishData.error)}`)
+      }
+    })
+  }
+
+  /**
+   * 发布接口需要的 x-xsrftoken，取值就是 cookie 里的 _xsrf
+   */
+  private async getXsrfToken(): Promise<string | null> {
+    if (!this.runtime.getCookie) {
+      logger.warn('getCookie API not available')
+      return null
+    }
+
+    // _xsrf 挂在 .zhihu.com 域下，几种域名写法都试一遍
+    for (const domain of ['www.zhihu.com', '.zhihu.com', 'zhihu.com']) {
+      const value = await this.runtime.getCookie(domain, '_xsrf')
+      if (value) {
+        logger.debug('Got _xsrf from cookies API:', domain)
+        return value
+      }
+    }
+
+    logger.warn('Could not find _xsrf')
+    return null
+  }
+
+  /**
+   * 生成 traceId 用的 uuid（抓包形如 "<毫秒时间戳>,<uuid>"）
+   */
+  private createUuid(): string {
+    const bytes = new Uint8Array(16)
+    crypto.getRandomValues(bytes)
+    // 补上 v4 的版本位和变体位
+    bytes[6] = (bytes[6] & 0x0f) | 0x40
+    bytes[8] = (bytes[8] & 0x3f) | 0x80
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
   }
 
   /**

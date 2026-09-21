@@ -192,77 +192,141 @@ export class CSDNAdapter extends CodeAdapter {
         }
       }
 
-      // Use pre-processed markdown content directly
-      let markdown = article.markdown || ''
+      // markdown 与 html 中的图片都要换成图床外链，用缓存避免同一张图重复上传
+      const uploaded = new Map<string, ImageUploadResult>()
+      const uploadFn = async (src: string): Promise<ImageUploadResult> => {
+        const cached = uploaded.get(src)
+        if (cached) return cached
 
-      // Process images in markdown
-      markdown = await this.processImages(
-        markdown,
-        (src) => this.uploadImageByUrl(src),
-        {
-          skipPatterns: ['csdnimg.cn', 'csdn.net'],
-          onProgress: options?.onImageProgress,
-        }
-      )
+        const result = await this.uploadImageByUrl(src)
+        uploaded.set(src, result)
+        return result
+      }
 
-      // Get HTML content (CSDN API needs both markdown and HTML)
-      const htmlContent = article.html || ''
+      // 正文里的图片（含 CLI 内联的 data URI）必须全部换成图床外链，
+      // 否则 base64 会原样进入请求体，被 CSDN 以「正文字数太多」拒绝
+      const markdown = await this.processImages(article.markdown || '', uploadFn, {
+        skipPatterns: ['csdnimg.cn', 'csdn.net'],
+        onProgress: options?.onImageProgress,
+      })
+
+      // CSDN 的 content 字段同样参与长度校验，要与 markdown 一样清洗
+      const htmlContent = await this.processImages(article.html || '', uploadFn)
+
+      const draftOnly = options?.draftOnly ?? true
 
       // Generate signature and save article
       const apiPath = '/blog-console-api/v3/mdeditor/saveArticle'
       const headers = await this.signRequest(apiPath)
 
-      const response = await this.runtime.fetch(
-        `https://bizapi.csdn.net${apiPath}`,
-        {
-          method: 'POST',
-          credentials: 'include',
-          headers,
-          body: JSON.stringify({
-            title: article.title,
-            markdowncontent: markdown,
-            content: htmlContent,
-            readType: 'public',
-            level: 0,
-            tags: '',
-            status: 2, // 草稿
-            categories: '',
-            type: 'original',
-            original_link: '',
-            authorized_status: false,
-            not_auto_saved: '1',
-            source: 'pc_mdeditor',
-            cover_images: [],
-            cover_type: 1,
-            is_new: 1,
-            vote_id: 0,
-            resource_id: '',
-            pubStatus: 'draft',
-            creator_activity_id: '',
-          }),
-        }
-      )
+      const bodyBase = {
+        title: article.title,
+        markdowncontent: markdown,
+        content: htmlContent,
+        readType: 'public',
+        level: 0,
+        tags: '',
+        categories: '',
+        type: 'original',
+        original_link: '',
+        authorized_status: false,
+        not_auto_saved: '1',
+        source: 'pc_mdeditor',
+        cover_images: [],
+        cover_type: 1,
+        is_new: 1,
+        vote_id: 0,
+        resource_id: '',
+        creator_activity_id: '',
+      }
+
+      // 抓包实测(2026-09-21): 直发强制要求标签非空，且 tags 是逗号拼接字符串（如 "python,爬虫"），
+      // 传数组会得到笼统的「Bad Request」；草稿模式不校验标签。
+      // 兜底标签由用户指定（2026-09-21）
+      const tagStr = (article.tags && article.tags.length ? article.tags : ['笔记', '经验分享']).slice(0, 3).join(',')
+
+      // 抓包实测: 编辑器直发是两步——先存草稿拿到文章 id，再带 id 调同一端点发布；
+      // 且直发要多带 Description(正文前256字摘要)/resource_url/creation_statement/template_id/sync_git_code
+      const plainText = (article.html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+      const description = plainText.substring(0, 256)
+
+      const url = `https://bizapi.csdn.net${apiPath}`
+
+      // 第一步：存草稿（直发也需要草稿返回的文章 id；draftOnly 时这就是最终动作）
+      const draftBody = { ...bodyBase, status: 2, pubStatus: 'draft' }
+      const draftResponse = await this.runtime.fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers,
+        body: JSON.stringify(draftBody),
+      })
+      const draftRes = await draftResponse.json() as {
+        code: number
+        message?: string
+        msg?: string
+        data?: { id: string | number }
+      }
+      logger.debug('Draft response:', draftRes)
+      if (draftRes.code !== 200 || !draftRes.data?.id) {
+        throw new Error(draftRes.msg || draftRes.message || '保存草稿失败')
+      }
+      const postId = String(draftRes.data.id)
+
+      if (draftOnly) {
+        return this.createResult(true, {
+          postId: postId,
+          postUrl: `https://editor.csdn.net/md?articleId=${postId}`,
+          draftOnly: true,
+        })
+      }
+
+      // 第二步：带 id 正式发布（字段形态对齐编辑器抓包: level 为字符串、tags 为逗号字符串）
+      const publishHeaders = await this.signRequest(apiPath)
+      const publishBody = {
+        ...bodyBase,
+        id: postId,
+        level: '0',
+        tags: tagStr,
+        Description: description,
+        resource_url: '',
+        status: 0,
+        pubStatus: 'publish',
+        creation_statement: 0,
+        template_id: -1,
+        sync_git_code: 0,
+      }
+      const response = await this.runtime.fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: publishHeaders,
+        body: JSON.stringify(publishBody),
+      })
 
       const res = await response.json() as {
         code: number
         message?: string
         msg?: string
-        data?: { id: string }
+        data?: { id: string | number; url?: string }
       }
 
-      logger.debug('Save response:', res)
+      logger.debug('Publish response:', res)
 
       if (res.code !== 200 || !res.data?.id) {
-        throw new Error(res.msg || res.message || '保存草稿失败')
+        throw new Error(res.msg || res.message || '发布失败')
       }
 
-      const postId = res.data.id
-      const draftUrl = `https://editor.csdn.net/md?articleId=${postId}`
+      const username = this.userInfo?.csdnid
+
+      // 直发已上架：优先用响应里的线上地址，其次拼博客页，拿不到用户名时回退编辑器地址
+      const postUrl = res.data.url
+        || (username
+          ? `https://blog.csdn.net/${username}/article/details/${postId}`
+          : `https://editor.csdn.net/md?articleId=${postId}`)
 
       return this.createResult(true, {
         postId: postId,
-        postUrl: draftUrl,
-        draftOnly: options?.draftOnly ?? true,
+        postUrl: postUrl,
+        draftOnly: false,
       })
     }).catch((error) => this.createResult(false, {
       error: (error as Error).message,
