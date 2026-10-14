@@ -37,6 +37,12 @@ interface CnblogsPost {
   [key: string]: unknown
 }
 
+/**
+ * 1 = 随笔（出现在博客首页与首页候选区），2 = 文章（无推荐入口）
+ * 实测同账号：随笔阅读 28~83，文章阅读 0
+ */
+const POST_TYPE_SNAPSHOT = 1
+
 export class CnblogsAdapter extends CodeAdapter {
   readonly meta: PlatformMeta = {
     id: 'cnblogs',
@@ -184,7 +190,7 @@ export class CnblogsAdapter extends CodeAdapter {
       // 3. 创建草稿（抓包确认: 博客园没有独立发布接口，发布与草稿走同一个 POST /api/posts）
       const draftBody: CnblogsPost = {
         id: null,
-        postType: 2, // 2 = 文章, 1 = 随笔
+        postType: POST_TYPE_SNAPSHOT,
         accessPermission: 0,
         title: article.title,
         url: null,
@@ -197,7 +203,7 @@ export class CnblogsAdapter extends CodeAdapter {
         siteCategoryId: null,
         blogTeamIds: null,
         isPublished: false,
-        displayOnHomePage: false,
+        displayOnHomePage: true,
         isAllowComments: true,
         includeInMainSyndication: false,
         isPinned: false,
@@ -234,7 +240,7 @@ export class CnblogsAdapter extends CodeAdapter {
       }
 
       const postId = String(created.id)
-      const draftUrl = `https://i.cnblogs.com/articles/edit;postId=${postId}`
+      const draftUrl = `https://i.cnblogs.com/posts/edit;postId=${postId}`
 
       logger.debug('Draft created:', postId)
 
@@ -340,13 +346,15 @@ export class CnblogsAdapter extends CodeAdapter {
     if (!post.url) {
       const login = await this.getBlogLogin()
       if (login) {
-        post.url = `https://www.cnblogs.com/${login}/articles/${postId}`
+        post.url = `https://www.cnblogs.com/${login}/p/${postId}`
       }
     }
 
     const now = new Date().toISOString()
 
     post.id = postId
+    post.postType = POST_TYPE_SNAPSHOT
+    post.displayOnHomePage = true
     post.title = title
     post.postBody = markdown
     post.isPublished = true
@@ -404,7 +412,8 @@ export class CnblogsAdapter extends CodeAdapter {
   }
 
   /**
-   * GET /api/posts/{id} 取服务端保存的完整 post
+   * GET /api/posts/{id} 取服务端保存的完整 post（随笔走这个路径，文章走 /api/articles/{id}）
+   * 实测响应包在 blogPost 里，直接当 post 用会取不到 blogId/author/url
    * @returns post 对象；请求失败或响应结构不认识时返回 null
    */
   private async fetchPostDetail(postId: number): Promise<CnblogsPost | null> {
@@ -420,7 +429,7 @@ export class CnblogsAdapter extends CodeAdapter {
       }
 
       const raw = await response.json() as Record<string, unknown>
-      const nested = raw.post && typeof raw.post === 'object' ? raw.post as CnblogsPost : null
+      const nested = raw.blogPost && typeof raw.blogPost === 'object' ? raw.blogPost as CnblogsPost : null
       return nested || (raw as CnblogsPost)
     } catch (error) {
       logger.debug('Fetch post detail failed:', error)

@@ -22,7 +22,9 @@ export class ExtensionBridge {
     reject: (error: Error) => void
     timeout: NodeJS.Timeout
   }>()
-  private requestTimeout = 360000 // 6 minutes (图片多时需要更长时间)
+  private requestTimeout = 720000 // 12 minutes：必须 > 扩展端单平台发布上限 10 分钟，
+  // 否则富图文文章（多图串行传微信素材接口实测 7~9 分钟）会被 CLI 提前误判失败，
+  // 而扩展其实仍在后台把草稿存成功（2026-09-21 实测产生过重复草稿）
   private connectionResolvers: Array<() => void> = []
 
   // 安全验证 token（从环境变量读取，优先使用 WECHATSYNC_TOKEN）

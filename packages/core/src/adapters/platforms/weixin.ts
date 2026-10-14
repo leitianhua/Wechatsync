@@ -243,7 +243,7 @@ export class WeixinAdapter extends CodeAdapter {
         share_video_id0: '',
         dot0: '{}',
         share_voice_id0: '',
-        insert_ad_mode0: '',
+        insert_ad_mode0: '2',
         categories_list0: '[]',
       })
 

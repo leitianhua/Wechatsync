@@ -32,6 +32,10 @@ import { fetchRemoteConfig, fetchConfigIfNeeded } from '../lib/remote-config'
 const logger = createLogger('Background')
 const MCP_RECONNECT_ALARM = 'mcp_reconnect'
 
+// 固定桥接 token：重装/重载扩展都不再变，与分发系统 distribute.json 的 token 保持一致。
+// 改了这里就必须同步改服务端配置，否则 CLI 会被扩展拒绝连接。
+const FIXED_MCP_TOKEN = '54e9cca8-10d4-46ae-9410-7d48be327c95'
+
 // CMS 类型
 type CMSType = 'wordpress' | 'typecho' | 'metaweblog'
 
@@ -612,9 +616,9 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
     }
 
     case 'MCP_ENABLE': {
-      // 检查是否已有 token，没有才生成新的
-      const storage = await chrome.storage.local.get(['mcpToken', 'mcpServerUrl'])
-      const token = storage.mcpToken || crypto.randomUUID()
+      // token 固定，不再随机生成（见 FIXED_MCP_TOKEN 注释）
+      const storage = await chrome.storage.local.get(['mcpServerUrl'])
+      const token = FIXED_MCP_TOKEN
       await chrome.storage.local.set({ mcpEnabled: true, mcpToken: token })
       // 设置 token、服务器地址并启动客户端
       mcpClient.setToken(token)
@@ -646,7 +650,7 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
       // 地址变更后，断开重连
       mcpClient.disconnect()
       const storage = await chrome.storage.local.get('mcpEnabled')
-      if (storage.mcpEnabled) {
+      if (storage.mcpEnabled !== false) {
         mcpClient.resetReconnect()
       }
       return { success: true }
@@ -666,7 +670,7 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
       const storage = await chrome.storage.local.get(['mcpEnabled', 'mcpToken', 'mcpServerUrl'])
       const mcpStatus = getMcpStatus()
       return {
-        enabled: storage.mcpEnabled ?? false,
+        enabled: storage.mcpEnabled ?? true,
         connected: mcpStatus.connected,
         connecting: mcpStatus.connecting,
         token: storage.mcpToken,  // 返回 token 供 MCP Server 使用
@@ -678,7 +682,7 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
 
     case 'MCP_RECONNECT': {
       const storage = await chrome.storage.local.get('mcpEnabled')
-      if (!storage.mcpEnabled) {
+      if (storage.mcpEnabled === false) {
         return { success: false, error: 'MCP connection is disabled' }
       }
       await initMcpIfEnabled()
@@ -1163,17 +1167,19 @@ async function initMcpIfEnabled() {
 
   mcpInitPromise = (async () => {
     const storage = await chrome.storage.local.get(['mcpEnabled', 'mcpToken', 'mcpServerUrl'])
+    // 默认开启：首次安装/重装后 storage 为空，不再要求用户手动开开关；
+    // 只有用户在弹窗里显式关过（mcpEnabled === false）才保持关闭
+    if (storage.mcpEnabled === undefined) {
+      await chrome.storage.local.set({ mcpEnabled: true })
+      storage.mcpEnabled = true
+    }
     if (storage.mcpEnabled) {
-      if (storage.mcpToken) {
-        mcpClient.setToken(storage.mcpToken)
-        logger.info(' Starting MCP client with existing token...')
-      } else {
-        // 没有 token，生成新的
-        const token = crypto.randomUUID()
-        await chrome.storage.local.set({ mcpToken: token })
-        mcpClient.setToken(token)
-        logger.info(' Starting MCP client with new token...')
+      // 一律使用固定 token；storage 里是历史随机值时纠正过来
+      if (storage.mcpToken !== FIXED_MCP_TOKEN) {
+        await chrome.storage.local.set({ mcpToken: FIXED_MCP_TOKEN })
       }
+      mcpClient.setToken(FIXED_MCP_TOKEN)
+      logger.info(' Starting MCP client with fixed token...')
       // 加载自定义服务器地址（支持远程桥接）
       mcpClient.setServerUrl(storage.mcpServerUrl || '')
       startMcpClient()

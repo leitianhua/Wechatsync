@@ -238,7 +238,7 @@ export class JuejinAdapter extends CodeAdapter {
       logger.info('Starting publish...')
 
       // 1. 获取 CSRF token
-      const csrfToken = await this.withTimeout('CSRF', 15000, () => this.getCsrfToken())
+      let csrfToken = await this.withTimeout('CSRF', 15000, () => this.getCsrfToken())
 
       // 2. 使用预处理好的 markdown（Content Script 已转换）
       // 掘金使用 Markdown 格式
@@ -286,7 +286,7 @@ export class JuejinAdapter extends CodeAdapter {
       // -> update 才写 tag_ids，所以标签在这一步留空，建完草稿后用 updateDraftTags 补写
       const tagIds = await this.resolveTagIds(article.tags)
 
-      const createResponse = await this.withTimeout('创建草稿', 30000, () => this.runtime.fetch(
+      const createDraft = () => this.withTimeout('创建草稿', 30000, () => this.runtime.fetch(
         'https://api.juejin.cn/content_api/v1/article_draft/create',
         {
           method: 'POST',
@@ -309,8 +309,21 @@ export class JuejinAdapter extends CodeAdapter {
         }
       ))
 
+      // 掘金风控对连发请求会返回 403 空响应（无业务错误码可读），实测是瞬时拦截、重试即过
+      // （10-07 #2397、10-04 #11044 等；历史 4 例隔几分钟重发全部成功），
+      // 所以这里刷新 CSRF token 后原样重试最多 2 次，避免整篇发布被瞬时风控打掉
+      let createResponse = await createDraft()
+      let responseText = await createResponse.text()
+      for (let retry = 1; retry <= 2 && createResponse.status === 403; retry++) {
+        logger.warn(`Create draft 403, retry ${retry}/2 with fresh CSRF token:`, responseText.substring(0, 100))
+        this.cachedCsrfToken = null
+        csrfToken = await this.withTimeout('CSRF', 15000, () => this.getCsrfToken())
+        await new Promise((resolve) => setTimeout(resolve, 3000))
+        createResponse = await createDraft()
+        responseText = await createResponse.text()
+      }
+
       // 检查响应状态和内容
-      const responseText = await createResponse.text()
       logger.debug('Create draft response:', createResponse.status, responseText.substring(0, 300))
 
       if (!createResponse.ok) {

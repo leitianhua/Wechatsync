@@ -237,7 +237,8 @@ export class McpClient {
 
     // 只在 MCP 启用时重连，避免无意义的后台重试消耗资源
     chrome.storage.local.get('mcpEnabled').then(storage => {
-      if (!storage.mcpEnabled) {
+      // undefined 也重连：扩展默认开启桥接，只有显式关过才停（见 background initMcpIfEnabled）
+      if (storage.mcpEnabled === false) {
         logger.debug('MCP disabled, skip reconnect')
         return
       }
