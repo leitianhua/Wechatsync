@@ -16,6 +16,26 @@ import { createLogger } from '../lib/logger'
 
 const logger = createLogger('SyncService')
 
+// ── 超时预算 ──────────────────────────────────────────────
+// 历史故障（10-24 #2400/#2388）：预处理里 chrome.tabs.sendMessage 没有超时，
+// 某个 tab 的渲染进程卡住时整条同步永远停在「预处理」，CLI/桥在 720s 后只拿到
+// 「Request timeout」，扩展侧 activeSyncState 永远是 syncing、results 为空。
+// 因此：预处理必须限时，整次同步必须在桥超时（12 分钟）之前带着结果返回。
+const PREPROCESS_TAB_TIMEOUT = 3000 // 单个 tab 等预处理响应的上限
+const PREPROCESS_MAX_TABS = 8 // 最多尝试的 tab 数（按 active tab 优先）
+const PREPROCESS_TIMEOUT = 15000 // 预处理总预算，超时就用原始内容继续发布
+const SYNC_DEADLINE = 11 * 60 * 1000 // 整次同步预算，必须小于 ws-bridge 的 12 分钟
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms)
+    promise.then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) }
+    )
+  })
+}
+
 // 同步结果类型
 export interface SyncResult {
   platform: string
@@ -242,6 +262,8 @@ export async function performSync(
   const allPlatformMetas = getAllPlatformMetas()
   const platformNameById = new Map(allPlatformMetas.map(meta => [meta.id, meta.name]))
   const syncId = generateSyncId()
+  const syncStartedAt = Date.now()
+  const preprocessDeadline = syncStartedAt + PREPROCESS_TIMEOUT
 
   // 规范化文章对象，确保必需字段有默认值
   const normalizedArticle = {
@@ -299,12 +321,21 @@ export async function performSync(
     }
     const rawHtml = normalizedArticle.html || normalizedArticle.content || ''
     if (rawHtml) {
-      const preprocessResult = await sendPreprocessMessage(rawHtml, platformsToPreprocess, configs)
+      let preprocessResult: Record<string, { html: string; markdown: string }> | null = null
+      try {
+        preprocessResult = await withTimeout(
+          sendPreprocessMessage(rawHtml, platformsToPreprocess, configs, preprocessDeadline),
+          PREPROCESS_TIMEOUT,
+          `预处理超时（${PREPROCESS_TIMEOUT / 1000}秒）`
+        )
+      } catch (error) {
+        logger.warn('Preprocess timed out, publishing raw content:', (error as Error).message)
+      }
       if (preprocessResult) {
         processedArticle = { ...normalizedArticle, platformContents: preprocessResult }
         logger.debug('Preprocessed for platforms:', Object.keys(preprocessResult))
       } else {
-        logger.warn('DOM preprocessing unavailable — please ensure at least one web page is open in Chrome')
+        logger.warn('DOM preprocessing unavailable — publishing raw content')
       }
     }
   }
@@ -313,29 +344,63 @@ export async function performSync(
 
   // 同步到 DSL 平台
   if (dslPlatformIds.length > 0) {
-    await syncToMultiplePlatforms(dslPlatformIds, processedArticle, {
-      onResult: (result) => {
-        const resultWithName: SyncResult = {
-          ...result,
-          platformName: platformNameById.get(result.platform) || result.platform,
-        }
-        syncState.results.push(resultWithName)
-        allResults.push(resultWithName)
-        saveSyncState(syncState).catch(() => {})
+    const remaining = Math.max(1000, SYNC_DEADLINE - (Date.now() - syncStartedAt))
+    try {
+      await withTimeout(
+        syncToMultiplePlatforms(dslPlatformIds, processedArticle, {
+          onResult: (result) => {
+            const resultWithName: SyncResult = {
+              ...result,
+              platformName: platformNameById.get(result.platform) || result.platform,
+            }
+            syncState.results.push(resultWithName)
+            allResults.push(resultWithName)
+            saveSyncState(syncState).catch(() => {})
 
-        onResult?.(resultWithName)
-      },
-      onImageProgress: (platform, current, total) => {
-        onImageProgress?.(platform, current, total)
-      },
-      onDetailProgress: (progress: SyncDetailProgress) => {
-        onDetailProgress?.(progress)
-      },
-    }, source, draftOnly)
+            onResult?.(resultWithName)
+          },
+          onImageProgress: (platform, current, total) => {
+            onImageProgress?.(platform, current, total)
+          },
+          onDetailProgress: (progress: SyncDetailProgress) => {
+            onDetailProgress?.(progress)
+          },
+        }, source, draftOnly),
+        remaining,
+        `同步总超时（${Math.round(SYNC_DEADLINE / 60000)}分钟）`
+      )
+    } catch (error) {
+      // 到点必须返回结果，否则 ws-bridge 会在 12 分钟时整体超时、平台侧一行结果都拿不到
+      logger.error('Sync deadline reached:', (error as Error).message)
+      for (const platformId of dslPlatformIds) {
+        if (allResults.some(r => r.platform === platformId)) continue
+        const missing: SyncResult = {
+          platform: platformId,
+          platformName: platformNameById.get(platformId) || platformId,
+          success: false,
+          error: (error as Error).message,
+        }
+        syncState.results.push(missing)
+        allResults.push(missing)
+        onResult?.(missing)
+      }
+    }
   }
 
   // 同步到 CMS 账户
   for (const accountId of cmsPlatformIds) {
+    if (Date.now() - syncStartedAt > SYNC_DEADLINE) {
+      const timeoutResult: SyncResult = {
+        platform: accountId,
+        platformName: platformNameById.get(accountId) || accountId,
+        success: false,
+        error: `同步总超时（${Math.round(SYNC_DEADLINE / 60000)}分钟）`,
+      }
+      allResults.push(timeoutResult)
+      syncState.results.push(timeoutResult)
+      onResult?.(timeoutResult)
+      continue
+    }
     const account = cmsAccounts.find((a: any) => a.id === accountId)
     if (!account) {
       const cmsResult: SyncResult = {
@@ -451,16 +516,22 @@ export async function performSync(
 /**
  * 查找可用 tab 并发送 PREPROCESS_FOR_PLATFORMS 消息
  * 优先 active tab，否则遍历所有 http/https tab
+ *
+ * 每个 tab 最多等 PREPROCESS_TAB_TIMEOUT，且整体不超过 deadlineAt：
+ * 卡死的渲染进程会让 sendMessage 永不返回，不能让它拖住整个同步。
  */
 async function sendPreprocessMessage(
   rawHtml: string,
   platforms: string[],
-  configs: Record<string, unknown>
+  configs: Record<string, unknown>,
+  deadlineAt = Date.now() + PREPROCESS_TIMEOUT
 ): Promise<Record<string, { html: string; markdown: string }> | null> {
   const message = {
     type: 'PREPROCESS_FOR_PLATFORMS',
     payload: { rawHtml, platforms, configs },
   }
+
+  const timeLeft = () => deadlineAt - Date.now()
 
   // 1. 优先尝试已有的 tab（content script 响应最快）
   try {
@@ -473,14 +544,21 @@ async function sendPreprocessMessage(
 
     const allTabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] })
     for (const tab of allTabs) {
+      if (candidateTabIds.length >= PREPROCESS_MAX_TABS) break
       if (tab.id && !candidateTabIds.includes(tab.id)) {
         candidateTabIds.push(tab.id)
       }
     }
 
     for (const tabId of candidateTabIds) {
+      const budget = Math.min(PREPROCESS_TAB_TIMEOUT, timeLeft())
+      if (budget <= 0) break
       try {
-        const response = await chrome.tabs.sendMessage(tabId, message)
+        const response = await withTimeout(
+          chrome.tabs.sendMessage(tabId, message),
+          budget,
+          `tab ${tabId} 预处理超时`
+        )
         if (response?.platformContents) return response.platformContents
       } catch {
         continue
@@ -490,8 +568,10 @@ async function sendPreprocessMessage(
     logger.debug('Tab preprocess failed:', error)
   }
 
+  if (timeLeft() <= 0) return null
+
   // 2. 没有可用 tab，创建临时扩展页面 tab 用于预处理
-  return await preprocessViaTemporaryTab(message)
+  return await preprocessViaTemporaryTab(message, deadlineAt)
 }
 
 const PREPROCESSOR_URL = chrome.runtime.getURL('src/preprocessor/index.html')
@@ -501,7 +581,8 @@ const PREPROCESSOR_URL = chrome.runtime.getURL('src/preprocessor/index.html')
  * 使用独立窗口避免在用户 tab 栏闪烁
  */
 async function preprocessViaTemporaryTab(
-  message: { type: string; payload: unknown }
+  message: { type: string; payload: unknown },
+  deadlineAt = Date.now() + PREPROCESS_TIMEOUT
 ): Promise<Record<string, { html: string; markdown: string }> | null> {
   let windowId: number | undefined
   let tabId: number | undefined
@@ -524,7 +605,7 @@ async function preprocessViaTemporaryTab(
       const timeout = setTimeout(() => {
         chrome.tabs.onUpdated.removeListener(listener)
         reject(new Error('Tab load timeout'))
-      }, 5000)
+      }, Math.min(5000, Math.max(1000, deadlineAt - Date.now())))
       const listener = (id: number, info: chrome.tabs.TabChangeInfo) => {
         if (id === tabId && info.status === 'complete') {
           chrome.tabs.onUpdated.removeListener(listener)
@@ -535,7 +616,12 @@ async function preprocessViaTemporaryTab(
       chrome.tabs.onUpdated.addListener(listener)
     })
 
-    const response = await chrome.tabs.sendMessage(tabId, message)
+    const budget = Math.max(1000, deadlineAt - Date.now())
+    const response = await withTimeout(
+      chrome.tabs.sendMessage(tabId, message),
+      budget,
+      '预处理临时页面无响应'
+    )
     if (response?.platformContents) {
       logger.debug('Preprocessed via temporary window')
       return response.platformContents

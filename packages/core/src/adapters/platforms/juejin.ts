@@ -145,6 +145,7 @@ export class JuejinAdapter extends CodeAdapter {
   private cachedCsrfToken: string | null = null
   private cachedImageXToken: ImageXToken | null = null
   private imageXTokenExpiry: number = 0
+  private imageXTokenPromise: Promise<ImageXToken> | null = null
   private uuid: string = generateUUID()
 
   /** 掘金 API 需要的 Header 规则 */
@@ -245,7 +246,9 @@ export class JuejinAdapter extends CodeAdapter {
       let markdown = article.markdown || ''
 
       // 3. 处理图片（上传到掘金图床）
-      markdown = await this.withTimeout('图片转存', 120000, () => this.processImages(
+      // 单图 30s 超时：一张图卡住就跳过该图，不拖垮整步；整步预算 300s（15~16 张图的正常耗时约 30s）
+      // 3 路并发：掘金每张图要走 token→apply→TOS→commit，串行时 15 张图能吃掉两分钟
+      markdown = await this.withTimeout('图片转存', 300000, () => this.processImages(
         markdown,
         (src) => this.uploadImageByUrl(src),
         {
@@ -254,6 +257,8 @@ export class JuejinAdapter extends CodeAdapter {
             'p6-juejin', 'p9-juejin', 'byteimg.com'
           ],
           onProgress: options?.onImageProgress,
+          perImageTimeout: 30000,
+          concurrency: 3,
         }
       ))
 
@@ -767,6 +772,16 @@ export class JuejinAdapter extends CodeAdapter {
       return this.cachedImageXToken
     }
 
+    // 并发转图时多个 worker 会同时来取，共享同一次请求
+    if (!this.imageXTokenPromise) {
+      this.imageXTokenPromise = this.fetchImageXToken().finally(() => {
+        this.imageXTokenPromise = null
+      })
+    }
+    return this.imageXTokenPromise
+  }
+
+  private async fetchImageXToken(): Promise<ImageXToken> {
     const url = `https://api.juejin.cn/imagex/v2/gen_token?aid=${IMAGEX_AID}&uuid=${this.uuid}&client=web`
     const response = await this.runtime.fetch(url, {
       method: 'GET',
