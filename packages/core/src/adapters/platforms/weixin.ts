@@ -44,6 +44,15 @@ i, cite, em, var, address { font-style: italic; }
 b, strong { font-weight: bolder; }
 `
 
+/** 声明原创：0 = 不声明，1 = 声明原创 */
+const DECLARE_ORIGINAL = 1
+
+/** 合集。id 留空则不挂合集；本机账号的「睡前故事」合集 */
+const ALBUM: { id: string; title: string } = { id: '4739927709437706250', title: '睡前故事' }
+
+/** 作者署名（笔名），显示在标题下方 */
+const AUTHOR = '啵啵'
+
 export class WeixinAdapter extends CodeAdapter {
   readonly meta: PlatformMeta = {
     id: 'weixin',
@@ -74,6 +83,87 @@ export class WeixinAdapter extends CodeAdapter {
       resourceTypes: ['xmlhttprequest'],
     },
   ]
+
+  /**
+   * 回读草稿做核验。只返回「数出来的指标」，不把草稿原文透出去。
+   * 一条图文可能有多个条目（头条+次条），所以正文指标按 items 数组返回，草稿级字段只给一份。
+   */
+  async checkDraft(appmsgid: string): Promise<{
+    appmsgid: string
+    count: number
+    title: string
+    author: string
+    cover: string
+    copyrightType: string
+    albumId: string
+    items: {
+      title: string
+      chars: number
+      images: number
+      gifs: number
+      sections: number
+      rounded: number
+      paraRuns: number[]
+      tailParas: number
+    }[]
+  }> {
+    if (!this.weixinMeta) throw new Error('未登录')
+    const { token } = this.weixinMeta
+    const id = String(appmsgid).replace(/[^\d]/g, '')
+    if (!id) throw new Error('appmsgid 只能是数字')
+
+    const editRaw = await (await this.runtime.fetch(
+      `https://mp.weixin.qq.com/cgi-bin/operate_appmsg?t=ajax-response&sub=edit&type=77&appmsgid=${id}&token=${token}&lang=zh_CN&f=json&ajax=1`,
+      { method: 'GET', credentials: 'include' }
+    )).text()
+    const editJson = (JSON.parse(editRaw.replace(/^[^{]*/, '')) as {
+      AppMsgItemList?: {
+        Title?: string; Author?: string; ImgURL?: string
+        Content?: string; MutilAppMsgItemList?: { Title?: string; Content?: string }[]
+      }[]
+    }).AppMsgItemList || []
+    const head = editJson[0]
+    if (!head) throw new Error(`草稿 ${id} 没读回来（可能已被删除，或 appmsgid 不对）`)
+
+    // 多个条目时微信把每个条目当成 AppMsgItemList 的一项返回；老结构则塞在 MutilAppMsgItemList 里
+    const raw = editJson.length > 1
+      ? editJson
+      : (head.MutilAppMsgItemList?.length ? head.MutilAppMsgItemList : [head])
+    const items0 = raw.filter((x) => x?.Content)
+    if (!items0.length) throw new Error(`草稿 ${id} 没读回正文（可能已被删除，或 appmsgid 不对）`)
+    const paras = (s: string) => (s.match(/<p[\s>]/g) || []).length
+    const items = items0.map((x) => {
+      const content = x.Content as string
+      const parts = content.split('<img')
+      return {
+        title: x.Title || '',
+        chars: content.replace(/<[^>]*>/g, '').replace(/&nbsp;|\s+/g, '').length,
+        images: parts.length - 1,
+        gifs: (content.match(/wx_fmt=gif/g) || []).length,
+        sections: (content.match(/<section/g) || []).length,
+        rounded: (content.match(/border-radius:\s*12px/g) || []).length,
+        // 每张图前面有几个自然段 —— "文字-图-文字" 真落地的指纹
+        paraRuns: parts.slice(1).map((_, k) => paras(parts[k])),
+        tailParas: paras(parts[parts.length - 1]),
+      }
+    })
+
+    const page = await (await this.runtime.fetch(
+      `https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&type=77&appmsgid=${id}&token=${token}&lang=zh_CN`,
+      { method: 'GET', credentials: 'include' }
+    )).text()
+
+    return {
+      appmsgid: id,
+      count: items.length,
+      title: head.Title || '',
+      author: head.Author || '',
+      cover: (head.ImgURL || '').slice(0, 46),
+      copyrightType: /copyright_type":(\d+)/.exec(page)?.[1] || '',
+      albumId: /appmsg_album_infos":\[\{"id":"(\d+)"/.exec(page)?.[1] || '',
+      items,
+    }
+  }
 
   async checkAuth(): Promise<AuthResult> {
     try {
@@ -132,6 +222,74 @@ export class WeixinAdapter extends CodeAdapter {
     }
   }
 
+  /**
+   * 一条图文里的第 i 个条目要提交的那批字段（微信用 title0/content0/fileid0… 这种下标约定）。
+   * 两条目就是把这套再写一遍、下标换成 1。
+   */
+  private itemFields(i: number, it: { title: string; content: string; fileId: string; cdnUrl: string }): Record<string, string> {
+    const k = (name: string) => `${name}${i}`
+    return {
+      [k('ad_video_transition')]: '',
+      [k('can_reward')]: '0',
+      [k('related_video')]: '',
+      [k('is_video_recommend')]: '-1',
+      [k('title')]: it.title,
+      [k('author')]: AUTHOR,
+      [k('writerid')]: '0',
+      [k('fileid')]: it.fileId,
+      [k('digest')]: '',
+      [k('auto_gen_digest')]: '1',
+      [k('content')]: it.content,
+      [k('sourceurl')]: '',
+      [k('need_open_comment')]: '1',
+      [k('only_fans_can_comment')]: '0',
+      [k('cdn_url')]: it.cdnUrl,
+      [k('cdn_235_1_url')]: '',
+      [k('cdn_1_1_url')]: '',
+      [k('cdn_url_back')]: it.cdnUrl,
+      [k('crop_list')]: '',
+      [k('music_id')]: '',
+      [k('video_id')]: '',
+      [k('voteid')]: '',
+      [k('voteismlt')]: '',
+      [k('supervoteid')]: '',
+      [k('cardid')]: '',
+      [k('cardquantity')]: '',
+      [k('cardlimit')]: '',
+      [k('vid_type')]: '',
+      [k('show_cover_pic')]: '0',
+      [k('shortvideofileid')]: '',
+      [k('copyright_type')]: String(DECLARE_ORIGINAL),
+      [k('releasefirst')]: '',
+      [k('platform')]: '',
+      [k('reprint_permit_type')]: '',
+      [k('allow_reprint')]: '',
+      [k('allow_reprint_modify')]: '',
+      [k('original_article_type')]: '',
+      // 合集：微信要的是 JSON 字符串 {"appmsg_album_infos":[{"id":..,"title":..}]}
+      [k('appmsg_album_info')]: ALBUM.id
+        ? JSON.stringify({ appmsg_album_infos: [{ id: ALBUM.id, title: ALBUM.title }] })
+        : JSON.stringify({ appmsg_album_infos: [] }),
+      [k('ori_white_list')]: '',
+      [k('free_content')]: '',
+      [k('fee')]: '0',
+      [k('ad_id')]: '',
+      [k('guide_words')]: '',
+      [k('is_share_copyright')]: '0',
+      [k('share_copyright_url')]: '',
+      [k('source_article_type')]: '',
+      [k('reprint_recommend_title')]: '',
+      [k('reprint_recommend_content')]: '',
+      [k('share_page_type')]: '0',
+      [k('share_imageinfo')]: '{"list":[]}',
+      [k('share_video_id')]: '',
+      [k('dot')]: '{}',
+      [k('share_voice_id')]: '',
+      [k('insert_ad_mode')]: '2',
+      [k('categories_list')]: '[]',
+    }
+  }
+
   async publish(article: Article, options?: PublishOptions): Promise<SyncResult> {
     return this.withHeaderRules(this.HEADER_RULES, async () => {
       logger.info('Starting publish...')
@@ -143,112 +301,96 @@ export class WeixinAdapter extends CodeAdapter {
         }
       }
 
-      // 微信到微信：使用原始 HTML，跳过所有处理
-      let content = (article.source?.platform === 'weixin' && (article as any).rawHtml)
-        ? (article as any).rawHtml
-        : (article.html || '')
+      // 一条图文可以有多个条目；没给 items 就是单条目（老行为不变）
+      const list: { title: string; content: string; cover?: string }[] =
+        Array.isArray((article as any).items) && (article as any).items.length
+          ? (article as any).items
+          : [{ title: article.title, content: (article as any).rawHtml || article.html || '', cover: article.cover }]
+      const rawPassthrough = article.source?.platform === 'weixin' && !!(article as any).rawHtml
 
-      if (article.source?.platform === 'weixin') {
-        logger.info('Source is WeChat, using raw HTML, skipping content processing')
-      } else {
-        content = this.processLatex(content)
-        content = this.stripExternalLinks(content)
-        content = await this.processImages(
-          content,
-          (src) => this.uploadImageByUrl(src),
-          {
-            skipPatterns: ['mmbiz.qpic.cn', 'mmbiz.qlogo.cn'],
-            onProgress: options?.onImageProgress,
-          }
-        )
-        content = this.processContent(content)
-      }
-
-      // 上传封面图(如有),拿 fileid + cdn_url 用于绑定草稿封面
-      let coverFileId = ''
-      let coverCdnUrl = ''
-      if (article.cover) {
-        try {
-          logger.info('Uploading cover image...')
-          const coverRes = await this.uploadImageByUrl(article.cover)
-          coverCdnUrl = coverRes.url
-          coverFileId = String(coverRes.attrs?.fileid ?? '')
-          logger.debug('Cover uploaded:', { coverFileId, coverCdnUrl })
-        } catch (err) {
-          // 封面上传失败不阻断正文发布,记录警告后继续
-          logger.warn('Cover upload failed, skipping cover:', (err as Error).message)
+      const prepared: { title: string; content: string; fileId: string; cdnUrl: string }[] = []
+      for (const it of list) {
+        let content = it.content || ''
+        if (rawPassthrough) {
+          logger.info('Source is WeChat, using raw HTML, skipping content processing')
+        } else {
+          content = this.processLatex(content)
+          content = this.stripExternalLinks(content)
+          content = await this.processImages(
+            content,
+            (src) => this.uploadImageByUrl(src),
+            {
+              skipPatterns: ['mmbiz.qpic.cn', 'mmbiz.qlogo.cn'],
+              onProgress: options?.onImageProgress,
+            }
+          )
+          content = this.processContent(content)
         }
+        // 每个条目一张自己的封面，fileid + cdn_url 用来绑定
+        let fileId = ''
+        let cdnUrl = ''
+        if (it.cover) {
+          try {
+            const r = await this.uploadImageByUrl(it.cover)
+            cdnUrl = r.url
+            fileId = String(r.attrs?.fileid ?? '')
+          } catch (err) {
+            logger.warn('Cover upload failed, skipping cover:', (err as Error).message)
+          }
+        }
+        prepared.push({ title: it.title, content, fileId, cdnUrl })
       }
 
-      const formData = new URLSearchParams({
+      const appmsgid = String((article as any).appmsgid || '')
+      // 每个条目一份的"索引信息"。只发 count 微信会丢掉第二个条目，
+      // 必须同时给 articlenum 和 req.idx_infos（字段抓自编辑器真实保存请求）
+      const idxInfo = {
+        save_old: 0,
+        cps_info: { cps_import: 0 },
+        red_packet_cover_list: { list: [] },
+        podcast_task_info: null,
+        love_like_style_info: { style: 0 },
+        claim_source: {},
+        line_info: { scene: 2 },
+        window_product: {},
+        link_info: {},
+        appmsg_link: {},
+        weapp_link: {},
+        topic_card: {},
+        yqj_info: {},
+        ai_pic_info: { cover_source: 0, ai_pic_id: [], cover_pic_id: '', ai_cover_auto_gen: 0 },
+        single_video_snap_card: {},
+        product_activity: {},
+        footer_gift_activity: {},
+        footer_common_shops: [],
+        footer_product_card: {},
+        location: {},
+      }
+      const fields: Record<string, string> = {
         token: this.weixinMeta!.token,
         lang: 'zh_CN',
         f: 'json',
         ajax: '1',
         random: String(Math.random()),
-        AppMsgId: '',
-        count: '1',
+        AppMsgId: appmsgid,
+        count: String(prepared.length),
+        articlenum: String(prepared.length),
+        req: JSON.stringify({
+          idx_infos: prepared.map(() => idxInfo),
+          ...(appmsgid ? { appmsg_id: Number(appmsgid) } : {}),
+          is_use_flag: 0,
+        }),
         data_seq: '0',
         operate_from: 'Chrome',
         isnew: '0',
-        ad_video_transition0: '',
-        can_reward0: '0',
-        related_video0: '',
-        is_video_recommend0: '-1',
-        title0: article.title,
-        author0: '',
-        writerid0: '0',
-        fileid0: coverFileId,
-        digest0: '',
-        auto_gen_digest0: '1',
-        content0: content,
-        sourceurl0: '',
-        need_open_comment0: '1',
-        only_fans_can_comment0: '0',
-        cdn_url0: coverCdnUrl,
-        cdn_235_1_url0: '',
-        cdn_1_1_url0: '',
-        cdn_url_back0: coverCdnUrl,
-        crop_list0: '',
-        music_id0: '',
-        video_id0: '',
-        voteid0: '',
-        voteismlt0: '',
-        supervoteid0: '',
-        cardid0: '',
-        cardquantity0: '',
-        cardlimit0: '',
-        vid_type0: '',
-        show_cover_pic0: '0',
-        shortvideofileid0: '',
-        copyright_type0: '0',
-        releasefirst0: '',
-        platform0: '',
-        reprint_permit_type0: '',
-        allow_reprint0: '',
-        allow_reprint_modify0: '',
-        original_article_type0: '',
-        ori_white_list0: '',
-        free_content0: '',
-        fee0: '0',
-        ad_id0: '',
-        guide_words0: '',
-        is_share_copyright0: '0',
-        share_copyright_url0: '',
-        source_article_type0: '',
-        reprint_recommend_title0: '',
-        reprint_recommend_content0: '',
-        share_page_type0: '0',
-        share_imageinfo0: '{"list":[]}',
-        share_video_id0: '',
-        dot0: '{}',
-        share_voice_id0: '',
-        insert_ad_mode0: '2',
-        categories_list0: '[]',
-      })
+      }
+      prepared.forEach((it, i) => Object.assign(fields, this.itemFields(i, it)))
 
+      const formData = new URLSearchParams(fields)
+
+      // 带 AppMsgId 时必须走 sub=update，走 sub=create 微信会另建一篇新草稿
       const response = await this.runtime.fetch(
-        `https://mp.weixin.qq.com/cgi-bin/operate_appmsg?t=ajax-response&sub=create&type=77&token=${this.weixinMeta!.token}&lang=zh_CN`,
+        `https://mp.weixin.qq.com/cgi-bin/operate_appmsg?t=ajax-response&sub=${appmsgid ? 'update' : 'create'}&type=77&token=${this.weixinMeta!.token}&lang=zh_CN`,
         {
           method: 'POST',
           credentials: 'include',

@@ -230,6 +230,8 @@ export async function performSync(
     html?: string
     markdown?: string
     cover?: string
+    appmsgid?: string
+    items?: { title: string; content?: string; markdown?: string; cover?: string }[]
   },
   platforms: string[],
   options: SyncOptions = {},
@@ -250,6 +252,10 @@ export async function performSync(
     html: article.html || article.content || '',
     markdown: article.markdown || '',
     cover: article.cover,
+    // 带上草稿 ID 就是原地更新，不带就是新建
+    appmsgid: article.appmsgid,
+    // 一条图文里的多个条目（头条+次条），没有就是单条
+    items: article.items,
   }
 
   // 获取 CMS 账户信息以区分 DSL 和 CMS

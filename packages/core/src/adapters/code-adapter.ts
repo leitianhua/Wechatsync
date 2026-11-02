@@ -287,14 +287,18 @@ export abstract class CodeAdapter implements PlatformAdapter {
         // 根据格式构建替换内容
         let replacement: string
         if (type === 'html') {
-          // HTML 格式
-          replacement = `<img src="${uploadResult.url}"`
+          // HTML 格式: 只替换 src，保留原标签的其余属性
+          // （style / data-type / data-ratio 等一旦丢失，微信正文里的圆角、尺寸就全没了）
+          replacement = full.replace(
+            /(<img[^>]*?\ssrc=")[^"]*(")/,
+            (_m, p1, p2) => p1 + uploadResult.url + p2
+          )
           if (uploadResult.attrs) {
-            for (const [key, value] of Object.entries(uploadResult.attrs)) {
-              replacement += ` ${key}="${value}"`
-            }
+            const extra = Object.entries(uploadResult.attrs)
+              .map(([key, value]) => ` ${key}="${value}"`)
+              .join('')
+            replacement = replacement.replace(/(\s*\/?>)$/, extra + ' />')
           }
-          replacement += ' />'
         } else {
           // Markdown 格式
           replacement = `![${alt || ''}](${uploadResult.url})`

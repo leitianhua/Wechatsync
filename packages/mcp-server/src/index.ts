@@ -102,6 +102,15 @@ function createServer(): Server {
                 type: 'string',
                 description: '封面图 URL 或 base64 data URI（可选）',
               },
+              appmsgid: {
+                type: 'string',
+                description: '要更新的已有草稿 ID（可选）。传了就在原草稿上改，不会再新建草稿。',
+              },
+              items: {
+                type: 'array',
+                description:
+                  '一条图文里的多个条目（头条 + 次条），可选。每项 {title, content, cover}。传了它就发多条内容进同一个草稿；没传就按顶层的 title/content/cover 发单条。',
+              },
             },
             required: ['platforms', 'title', 'markdown'],
           },
@@ -112,6 +121,20 @@ function createServer(): Server {
           inputSchema: {
             type: 'object',
             properties: {},
+          },
+        },
+        {
+          name: 'check_draft',
+          description: '回读微信公众号草稿，返回排版指标（图片/动图/背景层数量、段落与插图顺序、字数、原创、合集），用于发布后自检。',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              appmsgid: {
+                type: 'string',
+                description: '草稿 ID，即 sync_article 返回的 postId',
+              },
+            },
+            required: ['appmsgid'],
           },
         },
         {
@@ -179,12 +202,20 @@ function createServer(): Server {
               content: (args as { content: string }).content,
               markdown: (args as { markdown?: string }).markdown,
               cover: (args as { cover?: string }).cover,
+              appmsgid: (args as { appmsgid?: string }).appmsgid,
+              items: (args as { items?: unknown[] }).items,
             },
           })
           break
 
         case 'extract_article':
           result = await bridge.request('extractArticle')
+          break
+
+        case 'check_draft':
+          result = await bridge.request('checkDraft', {
+            appmsgid: (args as { appmsgid: string }).appmsgid,
+          })
           break
 
         case 'upload_image_file': {

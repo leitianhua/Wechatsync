@@ -409,6 +409,8 @@ export class McpClient {
           content?: string
           markdown?: string
           cover?: string
+          appmsgid?: string
+          items?: { title: string; content?: string; markdown?: string; cover?: string }[]
         }
 
         if (!platforms?.length) throw new Error('Missing platforms parameter')
@@ -437,6 +439,8 @@ export class McpClient {
           html: htmlContent,
           markdown: markdown,
           cover: articleData.cover,
+          appmsgid: articleData.appmsgid,
+          items: articleData.items,
         }
 
         // 使用 sync-service 进行同步（支持 DSL 平台 + CMS 账户、历史记录、状态保存）
@@ -478,6 +482,20 @@ export class McpClient {
           const response = await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_ARTICLE' })
           return response?.article || null
         }
+      }
+
+      case 'checkDraft': {
+        const appmsgid = params?.appmsgid as string
+        if (!appmsgid) throw new Error('Missing appmsgid parameter')
+
+        const adapter = await getAdapter('weixin')
+        if (!adapter) throw new Error('weixin adapter not found')
+        if (typeof (adapter as { checkDraft?: unknown }).checkDraft !== 'function') {
+          throw new Error('weixin adapter 不支持回读草稿')
+        }
+        return await (adapter as unknown as {
+          checkDraft(id: string): Promise<unknown>
+        }).checkDraft(String(appmsgid))
       }
 
       case 'uploadImage': {
