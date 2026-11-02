@@ -6,12 +6,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "node ../../scripts/guard-src-js.mjs clean && tsc --noEmit && vite build",
     "prod": "npm run build && cd dist && zip -r ../wechatsync-v$(node -p \"require('../package.json').version\").zip .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "vitest run",
+    "test": "node ../../scripts/guard-src-js.mjs check && vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
