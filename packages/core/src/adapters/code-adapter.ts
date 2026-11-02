@@ -46,6 +46,27 @@ export interface ImageProcessOptions {
   skipPatterns?: string[]
   /** 进度回调 */
   onProgress?: (current: number, total: number) => void
+  /**
+   * 单张图片处理超时（毫秒）。不设置则与旧行为一致（一直等）。
+   * 超时按「该图上传失败」处理：保留原图地址、继续处理剩余图片。
+   * 目的：一张图卡住 RPC 时不能把整篇文章的图片步骤拖到超时。
+   */
+  perImageTimeout?: number
+  /**
+   * 并发上传的图片数量，默认 1（串行，保留 300ms 间隔限速）。
+   * 只在平台图床能承受并发时开启；重复图片按 src 去重，只传一次。
+   */
+  concurrency?: number
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms)
+    promise.then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) }
+    )
+  })
 }
 
 /**
@@ -230,7 +251,7 @@ export abstract class CodeAdapter implements PlatformAdapter {
     uploadFn: (src: string) => Promise<ImageUploadResult>,
     options?: ImageProcessOptions
   ): Promise<string> {
-    const { skipPatterns = [], onProgress } = options || {}
+    const { skipPatterns = [], onProgress, perImageTimeout, concurrency = 1 } = options || {}
 
     // 提取所有图片（HTML + Markdown）
     const matches: { full: string; src: string; alt?: string; type: 'html' | 'markdown' }[] = []
@@ -253,68 +274,90 @@ export abstract class CodeAdapter implements PlatformAdapter {
 
     logger.debug(`Found ${matches.length} images to process (HTML + Markdown)`)
 
-    let result = content
+    const shouldSkip = (src: string) =>
+      !src.startsWith('data:') && skipPatterns.some(pattern => src.includes(pattern))
+
+    // 去重后统一上传；替换仍按原文出现顺序进行
+    const sources: string[] = []
+    const seen = new Set<string>()
+    for (const { src } of matches) {
+      if (!src || shouldSkip(src) || seen.has(src)) continue
+      seen.add(src)
+      sources.push(src)
+    }
+
     const uploadedMap = new Map<string, ImageUploadResult>()
     let processed = 0
 
-    for (const { full, src, alt, type } of matches) {
-      // 跳过空 src
-      if (!src) continue
-
-      // 跳过匹配的模式（但不跳过 data URI）
-      if (!src.startsWith('data:')) {
-        const shouldSkip = skipPatterns.some(pattern => src.includes(pattern))
-        if (shouldSkip) {
-          logger.debug(`Skipping matched pattern: ${src}`)
-          continue
-        }
-      }
-
-      processed++
-      onProgress?.(processed, matches.length)
-
+    const uploadOne = async (src: string) => {
       try {
-        // 检查是否已上传过
-        let uploadResult = uploadedMap.get(src)
-
-        if (!uploadResult) {
-          logger.debug(`Uploading image ${processed}/${matches.length}: ${src.startsWith('data:') ? 'data URI' : src}`)
-          // uploadFn 应该能处理 URL 和 data URI（通过 fetch）
-          uploadResult = await uploadFn(src)
-          uploadedMap.set(src, uploadResult)
-        }
-
-        // 根据格式构建替换内容
-        let replacement: string
-        if (type === 'html') {
-          // HTML 格式: 只替换 src，保留原标签的其余属性
-          // （style / data-type / data-ratio 等一旦丢失，微信正文里的圆角、尺寸就全没了）
-          replacement = full.replace(
-            /(<img[^>]*?\ssrc=")[^"]*(")/,
-            (_m, p1, p2) => p1 + uploadResult.url + p2
-          )
-          if (uploadResult.attrs) {
-            const extra = Object.entries(uploadResult.attrs)
-              .map(([key, value]) => ` ${key}="${value}"`)
-              .join('')
-            replacement = replacement.replace(/(\s*\/?>)$/, extra + ' />')
-          }
-        } else {
-          // Markdown 格式
-          replacement = `![${alt || ''}](${uploadResult.url})`
-        }
-
-        // 替换原内容
-        result = result.replace(full, replacement)
-
+        logger.debug(`Uploading image ${++processed}/${sources.length}: ${src.startsWith('data:') ? 'data URI' : src}`)
+        // uploadFn 应该能处理 URL 和 data URI（通过 fetch）
+        const uploadPromise = uploadFn(src)
+        const uploadResult = perImageTimeout
+          ? await withTimeout(
+              uploadPromise,
+              perImageTimeout,
+              `单张图片处理超时（${Math.round(perImageTimeout / 1000)}秒）`
+            )
+          : await uploadPromise
+        uploadedMap.set(src, uploadResult)
         logger.debug(`Image uploaded: ${uploadResult.url}`)
       } catch (error) {
+        // 单图失败只跳过该图，继续处理其他图片
         logger.error(`Failed to upload image: ${src}`, error)
-        // 继续处理其他图片
+      } finally {
+        onProgress?.(Math.min(processed, sources.length), sources.length)
+      }
+    }
+
+    const workerCount = Math.max(1, Math.min(Math.floor(concurrency) || 1, sources.length))
+    let cursor = 0
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (cursor < sources.length) {
+          const src = sources[cursor++]
+          await uploadOne(src)
+          // 串行模式保留原有 300ms 间隔；并行模式的速率由 workerCount 控制
+          if (workerCount === 1) await this.delay(300)
+        }
+      })
+    )
+
+    let result = content
+    for (const { full, src, alt, type } of matches) {
+      // 跳过空 src 和匹配的模式（但不跳过 data URI）
+      if (!src) continue
+      if (shouldSkip(src)) {
+        logger.debug(`Skipping matched pattern: ${src}`)
+        continue
       }
 
-      // 避免请求过快
-      await this.delay(300)
+      const uploadResult = uploadedMap.get(src)
+      if (!uploadResult) continue
+
+      // 根据格式构建替换内容
+      let replacement: string
+      if (type === 'html') {
+        // HTML 格式: 只替换 src，保留原标签的其余属性
+        // （style / data-type / data-ratio 等一旦丢失，微信正文里的圆角、尺寸就全没了）
+        replacement = full.replace(
+          /(<img[^>]*?\ssrc=")[^"]*(")/,
+          (_m, p1, p2) => p1 + uploadResult.url + p2
+        )
+        if (uploadResult.attrs) {
+          const extra = Object.entries(uploadResult.attrs)
+            .map(([key, value]) => ` ${key}="${value}"`)
+            .join('')
+          replacement = replacement.replace(/(\s*\/?>)$/, extra + ' />')
+        }
+      } else {
+        // Markdown 格式
+        replacement = `![${alt || ''}](${uploadResult.url})`
+      }
+
+      // 替换原内容
+      result = result.replace(full, replacement)
     }
 
     return result
